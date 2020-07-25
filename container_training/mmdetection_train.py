@@ -1,21 +1,8 @@
-# # Check Pytorch installation
-# import torch, torchvision
-# print(f"Torch version: {torch.__version__}, is CUDA on? {torch.cuda.is_available()}")
-
-# # Check MMDetection installation
-# import mmdet
-# print(f"MMDET version {mmdet.__version__}")
-
-# # Check mmcv installation
-# from mmcv.ops import get_compiling_cuda_version, get_compiler_version
-# print(f"MMVC CUDA version {get_compiling_cuda_version()}")
-# print(f"MMVC compiler version {get_compiler_version()} ")
-
-
 from argparse import ArgumentParser
 import os
 from mmcv import Config
-
+import json
+import subprocess
 
 
 def get_training_world():
@@ -47,23 +34,26 @@ def training_configurator(args):
     """
     
     # updating path to config file inside SM container
-    print(f"Will use config from file {os.path.abspath(args.config_file)}")
-    cfg = Config.fromfile(os.path.abspath(args.config_file))
+    abs_config_path = os.path.join("/opt/ml/code/mmdetection", args.config_file)
+    print(f"Will use config from file {abs_config_path}")
+    cfg = Config.fromfile(abs_config_path)
     
     if args.dataset.lower() == "coco":
-        # TODO: need to pass proper data folder via envrionmental variable
-        cfg.data_root = os.path.join("/opt/ml/input/data/")
-        cfg.data.train.ann_file = "annotations/instances_train2017.json"
-        cfg.data.train.img_prefix = "train2017"
-        cfg.data.val.ann_file = "annotations/instances_val2017.json"
-        cfg.data.val.img_prefix = "val2017"
-        cfg.data.test.ann_file = "annotations/instances_test2017.json"
-        cfg.data.test.img_prefix = "test2017"
+        
+        cfg.data_root = os.environ["SM_CHANNEL_TRAINING"] # By default, data will be download to /opt/ml/input/data/training
+        cfg.data.train.ann_file = os.path.join(cfg.data_root, "annotations/instances_train2017.json")
+        cfg.data.train.img_prefix = os.path.join(cfg.data_root, "train2017")
+        cfg.data.val.ann_file = os.path.join(cfg.data_root, "annotations/instances_val2017.json")
+        cfg.data.val.img_prefix = os.path.join(cfg.data_root, "val2017")
+        cfg.data.test.ann_file = os.path.join(cfg.data_root, "annotations/instances_val2017.json")
+        cfg.data.test.img_prefix = os.path.join(cfg.data_root, "val2017")
+        
+        # TODO: delete it
+        print("DEBUG \n data root", os.listdir(cfg.data_root)) 
         
         updated_config = os.path.join(os.getcwd(), "updated_config.py")
         cfg.dump(updated_config)
-        print("Following config will be used for training:
-              {cfg.pretty_text}")
+        print(f"Following config will be used for training:{cfg.pretty_text}")
         
     else:
         raise NotImplementedError(f"Dataset {args.dataset} is not implemented.\
@@ -88,15 +78,39 @@ if __name__ == "__main__":
     config_file = training_configurator(sm_args)
 
     # Derive parameters of distributed training cluster in Sagemaker
-    world = get_training_world()
-
-    # Creates launch configuration according to PyTorch Distributed Launch utility requirements: 
-    # https://github.com/pytorch/pytorch/blob/master/torch/distributed/launch.py
-    launch_config = ["--nnodes", str(world['number_of_machines']), "--node_rank", str(world['machine_rank']),
+    world = get_training_world()  
+    
+              
+    # Train script config
+    launch_config = [ "python -m torch.distributed.launch", 
+                     "--nnodes", str(world['number_of_machines']), "--node_rank", str(world['machine_rank']),
                      "--nproc_per_node", str(world['number_of_processes']), "--master_addr", world['master_addr'], 
                      "--master_port", world['master_port']]
+ 
+    train_config = [os.path.join(os.environ["MMDETECTION"], "tools/train.py"), 
+                    config_file, 
+                    "--launcher", "pytorch", 
+                    # TODO: add ability to pass MMD arguments via https://github.com/open-mmlab/mmcv/blob/master/mmcv/utils/config.py#L386-L415
+                    #                     mmdetection_args if mmdetection_args!="" 
+                    
+                   ]
     
-    # TODO: implement running inline with this sample: https://github.com/vdabravolski/mxnet-distributed-sample/blob/master/container_training/hvd_launcher.py#L177-L198
-#     % env MKL_THREADING_LAYER=GNU
-#     ! python -m torch.distributed.launch --nproc_per_node=4 --master_port=29500 tools/train.py ./configs/faster_rcnn/faster_rcnn_r50_caffe_fpn_mstrain_1x_coco.py --launcher pytorch
-
+    # Concat MPI run configuration and training script and its parameters
+    joint_cmd = " ".join(str(x) for x in launch_config+train_config)
+    print("Following command will be executed: \n", joint_cmd)
+    
+    process = subprocess.Popen(joint_cmd,  stderr=subprocess.STDOUT, stdout=subprocess.PIPE, shell=True)
+    
+    while True:
+        output = process.stdout.readline()
+        
+        if process.poll() is not None:
+            break
+        if output:
+            print(output.decode("utf-8").strip())
+    rc = process.poll()
+    
+    if process.returncode != 0:
+        raise subprocess.CalledProcessError(returncode=process.returncode, cmd=joint_cmd)
+    
+    sys.exit(process.returncode)

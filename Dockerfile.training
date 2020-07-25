@@ -16,6 +16,7 @@ RUN cd mmdetection/ && \
 
 # to address https://github.com/pytorch/pytorch/issues/37377
 ENV MKL_THREADING_LAYER GNU
+ENV MMDETECTION /opt/ml/code/mmdetection
 
 ############# Configuring Sagemaker ##############
 COPY container_training /opt/ml/code
@@ -23,7 +24,7 @@ COPY container_training /opt/ml/code
 ENV SAGEMAKER_SUBMIT_DIRECTORY /opt/ml/code
 ENV SAGEMAKER_PROGRAM mmdetection_train.py
 
-WORKDIR /opt/ml/code/mmdetection
+WORKDIR /
 
 # Starts PyTorch distributed framework
-ENTRYPOINT ["bash", "-m", "start_with_right_hostname.sh"]
+# ENTRYPOINT ["bash", "-m", "start_with_right_hostname.sh"]
