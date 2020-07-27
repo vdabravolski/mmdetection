@@ -1,8 +1,9 @@
 from argparse import ArgumentParser
 import os
-from mmcv import Config
+from mmcv import Config, DictAction
 import json
 import subprocess
+import sys
 
 
 def get_training_world():
@@ -28,9 +29,13 @@ def get_training_world():
 
     return world
 
-def training_configurator(args):
+def training_configurator(args, world):
+    
     """
-    Configure training process
+    Configure training process by updating config file: 
+    - takes base config from MMDetection templates;
+    - updates it with SageMaker specific data locations;
+    - overrides with user-defined options.
     """
     
     # updating path to config file inside SM container
@@ -45,11 +50,18 @@ def training_configurator(args):
         cfg.data.train.img_prefix = os.path.join(cfg.data_root, "train2017")
         cfg.data.val.ann_file = os.path.join(cfg.data_root, "annotations/instances_val2017.json")
         cfg.data.val.img_prefix = os.path.join(cfg.data_root, "val2017")
+        
+        # Note, that we are using validation dataset for testing purposes
         cfg.data.test.ann_file = os.path.join(cfg.data_root, "annotations/instances_val2017.json")
         cfg.data.test.img_prefix = os.path.join(cfg.data_root, "val2017")
         
-        # TODO: delete it
-        print("DEBUG \n data root", os.listdir(cfg.data_root)) 
+        # Overriding config with options
+        if args.options is not None:
+            cfg.merge_from_dict(args.options)
+        
+        # scaling LR based on number of training processes
+        if args.auto_scale:
+            cfg = auto_scale_config(cfg, world)
         
         updated_config = os.path.join(os.getcwd(), "updated_config.py")
         cfg.dump(updated_config)
@@ -61,6 +73,34 @@ def training_configurator(args):
               
     return updated_config
 
+def auto_scale_config(cfg, world):
+    """
+    Method automatically scales learning rate
+    based on number of processes in distributed cluster.
+    
+    When scaling, we take user-provided config as a config for single node with 8 GPUs
+    and scale it based on total number of training processes.
+    
+    Note, that batch size is not scaled, as MMDetection uses relative
+    batch size: cfg.data.samples_per_gpu
+    """
+    
+    old_world_size = 8 # Note, this is a hardcoded value, as MMDetection configs are build for single 8-GPU V100 node.
+    old_lr = cfg.optimizer.lr
+    old_lr_warmup = cfg.lr_config.warmup_iters
+    scale = world["size"] / old_world_size
+    
+    cfg.optimizer.lr = old_lr * scale
+    cfg.lr_config.warmup_iters = old_lr_warmup / scale
+    
+    print(f"""Initial learning rate {old_lr} and warmup {old_lr_warmup} were scaled \
+          to {cfg.optimizer.lr} and {cfg.lr_config.warmup_iters} respectively.
+          Each GPU has batch size of {cfg.data.samples_per_gpu},
+          Total number of GPUs in training cluster is {world['size']}.
+          Effective batch size is {cfg.data.samples_per_gpu * world['size']}""")
+    
+    return cfg
+
 
 if __name__ == "__main__":
     
@@ -71,15 +111,18 @@ if __name__ == "__main__":
                         help="Only default MMDetection configs are supported now. \
                         See for details: https://github.com/open-mmlab/mmdetection/tree/master/configs/")
     parser.add_argument('--dataset', type=str, default="coco", help="Define which dataset to use.")
-    
-    sm_args, mmdetection_args = parser.parse_known_args()
-
-    # Get task script and its cofiguration
-    config_file = training_configurator(sm_args)
+    parser.add_argument('--options', nargs='+', action=DictAction, help='Config overrides.')
+    parser.add_argument('--auto-scale', type=lambda s: s.lower() in ['true', 't', 'yes', '1'], 
+                        default=False, help="whether to scale batch parameters and learning rate based on cluster size")
+    args, unknown = parser.parse_known_args()
+    if unknown:
+        print(f"Following arguments were not recognized and won't be used: {unknown}")
 
     # Derive parameters of distributed training cluster in Sagemaker
     world = get_training_world()  
-    
+
+    # Update config file
+    config_file = training_configurator(args, world)
               
     # Train script config
     launch_config = [ "python -m torch.distributed.launch", 
@@ -90,12 +133,10 @@ if __name__ == "__main__":
     train_config = [os.path.join(os.environ["MMDETECTION"], "tools/train.py"), 
                     config_file, 
                     "--launcher", "pytorch", 
-                    # TODO: add ability to pass MMD arguments via https://github.com/open-mmlab/mmcv/blob/master/mmcv/utils/config.py#L386-L415
-                    #                     mmdetection_args if mmdetection_args!="" 
-                    
+                    "--work-dir", os.environ['SM_OUTPUT_DIR']
                    ]
     
-    # Concat MPI run configuration and training script and its parameters
+    # Concat Pytorch Distributed Luanch configuration and MMdetection params
     joint_cmd = " ".join(str(x) for x in launch_config+train_config)
     print("Following command will be executed: \n", joint_cmd)
     
