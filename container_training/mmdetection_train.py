@@ -101,6 +101,37 @@ def auto_scale_config(cfg, world):
     
     return cfg
 
+def options_to_dict(options):
+    """
+    Takes string of options in format of 'key1=value1; key2=value2 ...'
+    and produces dictionary object {'key1': 'value1', 'key2':'value2'...}.
+    
+    It also supports lists as value: key3=v1,v2,v3.
+    """
+    
+    options_dict = dict(item.split("=") for item in options.split("; ")) 
+    
+    for key, value in options_dict.items():
+        value = [_parse_int_float_bool(v) for v in value.split(",")]
+        if len(value) == 1:
+            value = value[0]
+        options_dict[key] = value
+    return options_dict
+
+
+def _parse_int_float_bool(val):
+    try:
+        return int(val)
+    except ValueError:
+        pass
+    try:
+        return float(val)
+    except ValueError:
+        pass
+    if val.lower() in ['true', 'false']:
+        return True if val.lower() == 'true' else False
+    return val
+
 
 if __name__ == "__main__":
     
@@ -111,10 +142,15 @@ if __name__ == "__main__":
                         help="Only default MMDetection configs are supported now. \
                         See for details: https://github.com/open-mmlab/mmdetection/tree/master/configs/")
     parser.add_argument('--dataset', type=str, default="coco", help="Define which dataset to use.")
-    parser.add_argument('--options', nargs='+', action=DictAction, help='Config overrides.')
+    parser.add_argument('--options', nargs='+', type=str, default=None, help='Config overrides.')
     parser.add_argument('--auto-scale', type=lambda s: s.lower() in ['true', 't', 'yes', '1'], 
                         default=False, help="whether to scale batch parameters and learning rate based on cluster size")
+    
     args, unknown = parser.parse_known_args()
+    
+    if args.options is not None:
+        args.options = options_to_dict(args.options[0])        
+    
     if unknown:
         print(f"Following arguments were not recognized and won't be used: {unknown}")
 
